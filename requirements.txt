@@ -3,3 +3,8 @@ poselib
 kornia==0.7.2
 tqdm
 gdown
+
+# for zipline scripts:
+matplotlib
+imageio
+onnxruntime
