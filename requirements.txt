@@ -7,4 +7,4 @@ gdown
 # for zipline scripts:
 matplotlib
 imageio
-onnxruntime
+onnxruntime-gpu
