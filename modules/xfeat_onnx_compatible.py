@@ -291,6 +291,41 @@ class XFeat(nn.Module):
         # return (ref_points, dst_points, ref_output_idx_vec, final_mask)
         return (ref_output_idx_vec, ref_points, target_output_idx_vec, dst_points)
 
+    @torch.inference_mode()
+    def match_xfeat_star_onnx_no_refinement(self, dec1_desc, dec2_desc, min_cossim=0.82):
+        """
+        Simplified ONNX-compatible matching without batched inference or subpixel refinement.
+        Returns a single array of indices in the target image, indexed by the indices in the source image.
+        For points in the source image without a match in the target image, the index is -1.
+        """
+        # Remove batch dimension and work with single batch
+        dec1_desc = dec1_desc[0]
+        dec2_desc = dec2_desc[0]
+
+        # Perform descriptor matching without batching
+        cossim = torch.mm(dec1_desc, dec2_desc.t())
+        match12 = torch.argmax(cossim, dim=-1)
+        match21 = torch.argmax(cossim.t(), dim=-1)
+
+        # Find mutual matches
+        idx0 = torch.arange(match12.shape[0], device=match12.device)
+        mutual = match21[match12] == idx0
+
+        # Filter by cosine similarity threshold
+        cossim_max, _ = cossim.max(dim=1)
+        good = cossim_max > min_cossim
+
+        # Get valid match indices
+        valid_matches = mutual & good
+
+        # Create output array initialized with -1 (no match)
+        target_indices = torch.full((match12.shape[0],), -1, dtype=torch.long, device=match12.device)
+        
+        # Fill in valid matches
+        target_indices[valid_matches] = match12[valid_matches]
+
+        return target_indices
+
     def preprocess_tensor(self, x):
         """ Guarantee that image is divisible by 32 to avoid aliasing artifacts.
             If the image is larger than 1920x1080, it will first be resized to 1920x1080.
@@ -307,8 +342,7 @@ class XFeat(nn.Module):
         x = F.interpolate(x, (_H, _W), mode='bilinear', align_corners=False)
         return x, rh, rw
 
-    @torch.inference_mode()
-    def batch_match(self, feats1, feats2, min_cossim=-1):
+    def batch_match(self, feats1, feats2, min_cossim=0.82):
         B = feats1.shape[0]
         cossim = torch.bmm(feats1, feats2.permute(0, 2, 1))
         match12 = torch.argmax(cossim, dim=-1)
@@ -320,15 +354,10 @@ class XFeat(nn.Module):
 
         for b in range(B):
             mutual = match21[b][match12[b]] == idx0
-
-            if min_cossim > 0:
-                cossim_max, _ = cossim[b].max(dim=1)
-                good = cossim_max > min_cossim
-                idx0_b = idx0[mutual & good]
-                idx1_b = match12[b][mutual & good]
-            else:
-                idx0_b = idx0[mutual]
-                idx1_b = match12[b][mutual]
+            cossim_max, _ = cossim[b].max(dim=1)
+            good = cossim_max > min_cossim
+            idx0_b = idx0[mutual & good]
+            idx1_b = match12[b][mutual & good]
 
             batched_matches.append((idx0_b, idx1_b))
 

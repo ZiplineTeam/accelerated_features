@@ -545,10 +545,14 @@ def validate_onnx_matcher(detector_onnx_path, matcher_onnx_path, test_image1_pat
     target_idx = match_outputs[2]
     target_points = match_outputs[3]
 
-    print(f"\nMatching results:")
-    print(f"Number of matches: {len(ref_points)}")
-    print(f"Reference points: {ref_points.shape}")
-    print(f"Target points: {target_points.shape}")
+    # We want some stats about how keypoints moved due to refinement
+    # We can do this by comparing the original keypoints with the refined ones
+    for i in range(len(ref_points)):
+        print(f"Refined reference keypoint {i}: {ref_points[i]}")
+        idx = int(ref_idx[i][0])
+        print(idx)
+        original = dec1_kps_np[0, idx]
+        print(f"Original target keypoint {idx}: {original}")
 
     if save_visualization and len(ref_points) > 0:
         # Create output filename
@@ -568,6 +572,7 @@ def validate_onnx_matcher(detector_onnx_path, matcher_onnx_path, test_image1_pat
         # Save visualization
         cv2.imwrite(output_path, canvas)
         print(f"Match visualization saved to: {output_path}")
+        print("Legend: Green lines = refined matches, Blue circles = original positions, Cyan lines = refinement displacement")
 
     print("\nMatcher validation successful!")
 
@@ -643,7 +648,7 @@ def export_detector_sparse(xfeat_model, output_path, device):
             if img.device != model_device:
                 img = img.to(model_device)
             # xfeat_detect_sparse returns a tuple (keypoints, descriptors, scores)
-            return self.model.xfeat_detect_sparse(img, top_k=750, detection_threshold=0.25, kernel_size=15)
+            return self.model.xfeat_detect_sparse(img, top_k=500, detection_threshold=0.25, kernel_size=17)
 
     detect_xfeat_sparse_wrapper = DetectXFeatSparseWrapper(xfeat_onnx_model)
     detect_xfeat_sparse_wrapper = detect_xfeat_sparse_wrapper.to(device)
@@ -788,7 +793,7 @@ def main():
 
         if args.model in ['match', 'all']:
             # For matcher validation, we need both detector and matcher models
-            detector_path = args.output_detect_sparse
+            detector_path = args.output_detect
             if args.model == 'match' and not os.path.exists(detector_path):
                 print(
                     f"Warning: Detector model {detector_path} not found. Skipping matcher validation.")
