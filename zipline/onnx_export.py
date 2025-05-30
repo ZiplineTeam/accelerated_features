@@ -220,28 +220,8 @@ def prepare_match_inputs(output1, output2):
     return dec1_ids_np, dec1_kps_np, dec1_desc_np, dec1_sc_np, dec2_ids_np, dec2_kps_np, dec2_desc_np
 
 
-def warp_corners_and_draw_matches(ref_points, dst_points, img1, img2):
-    """Visualize matches between two images"""
-    # # Calculate the Homography matrix
-    # H, mask = cv2.findHomography(
-    #     ref_points, dst_points, cv2.USAC_MAGSAC, 3.5, maxIters=1000, confidence=0.999)
-    # mask = mask.flatten() > 0
-
-    # # Get corners of the first image (image1)
-    # h, w = img1.shape[:2]
-    # corners_img1 = np.array(
-    #     [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32).reshape(-1, 1, 2)
-
-    # # Warp corners to the second image (image2) space using the Homography matrix
-    # warped_corners = cv2.perspectiveTransform(corners_img1, H)
-
-    # # Draw the warped corners in image2
-    # img2_with_corners = img2.copy()
-    # for i in range(len(warped_corners)):
-    #     start_point = tuple(warped_corners[i - 1][0].astype(int))
-    #     end_point = tuple(warped_corners[i][0].astype(int))
-    #     cv2.line(img2_with_corners, start_point, end_point,
-    #              (0, 255, 0), 4)  # Green color for corners
+def warp_corners_and_draw_matches(ref_points, dst_points, img1, img2, unmatched_kpts1=None, unmatched_kpts2=None):
+    """Visualize matches between two images, with unmatched features shown in red"""
 
     # Prepare keypoints from the reference and destination points
     keypoints1 = [cv2.KeyPoint(p[0], p[1], 5) for p in ref_points]
@@ -258,6 +238,20 @@ def warp_corners_and_draw_matches(ref_points, dst_points, img1, img2):
         matchColor=(0, 255, 0),  # Green color for matches
         singlePointColor=(0, 0, 255),  # Red color for unmatched keypoints
     )
+
+    # Draw unmatched keypoints in red if provided
+    if unmatched_kpts1 is not None and len(unmatched_kpts1) > 0:
+        for kpt in unmatched_kpts1:
+            x, y = int(kpt[0]), int(kpt[1])
+            # Red circle for unmatched in img1
+            cv2.circle(img_matches, (x, y), 3, (0, 0, 255), -1)
+
+    if unmatched_kpts2 is not None and len(unmatched_kpts2) > 0:
+        img_width = img1.shape[1]
+        for kpt in unmatched_kpts2:
+            x, y = int(kpt[0] + img_width), int(kpt[1])  # Offset by img1 width
+            # Red circle for unmatched in img2
+            cv2.circle(img_matches, (x, y), 3, (0, 0, 255), -1)
 
     return img_matches
 
@@ -572,7 +566,7 @@ def validate_onnx_matcher(detector_onnx_path, matcher_onnx_path, test_image1_pat
         # Save visualization
         cv2.imwrite(output_path, canvas)
         print(f"Match visualization saved to: {output_path}")
-        print("Legend: Green lines = refined matches, Blue circles = original positions, Cyan lines = refinement displacement")
+        print("Legend: Green lines = matches")
 
     print("\nMatcher validation successful!")
 
@@ -745,6 +739,14 @@ def export_detect_and_match_dense(xfeat_model, output_path, device):
     """Export the combined detect_and_match_dense model to ONNX."""
     print(f"\nExporting combined detect-and-match model to {output_path}...")
 
+    # Create ONNX-compatible model
+    from modules.xfeat_onnx_compatible import XFeat as XFeatONNX
+    xfeat_onnx_model = XFeatONNX().to(device)
+
+    # Load the same weights
+    if hasattr(xfeat_model, 'net'):
+        xfeat_onnx_model.net.load_state_dict(xfeat_model.net.state_dict())
+
     # Create wrapper for combined detection and matching
     class DetectAndMatchWrapper(torch.nn.Module):
         def __init__(self, model):
@@ -753,9 +755,9 @@ def export_detect_and_match_dense(xfeat_model, output_path, device):
 
         @torch.inference_mode()
         def forward(self, img1, img2):
-            return self.model.detect_and_match_dense(img1, img2, top_k=2000, min_cossim=0.82)
+            return self.model.detect_and_match_dense(img1, img2, top_k=2000, min_cossim=0.88)
 
-    detect_match_wrapper = DetectAndMatchWrapper(xfeat_model)
+    detect_match_wrapper = DetectAndMatchWrapper(xfeat_onnx_model)
     detect_match_wrapper = detect_match_wrapper.to(device)
 
     # Create dummy inputs for export (grayscale images)
@@ -773,15 +775,17 @@ def export_detect_and_match_dense(xfeat_model, output_path, device):
         do_constant_folding=True,
         input_names=['img1', 'img2'],
         output_names=['keypoints1', 'keypoints2',
-                      'descriptors1', 'descriptors2', 'target_indices'],
+                      'descriptors1', 'descriptors2', 'scales1', 'scales2', 'target_indices'],
         dynamic_axes={
             'img1': {2: 'height1', 3: 'width1'},
             'img2': {2: 'height2', 3: 'width2'},
-            'keypoints1': {0: 'num_matches'},
-            'keypoints2': {0: 'num_matches'},
-            'descriptors1': {0: 'num_matches'},
-            'descriptors2': {0: 'num_matches'},
-            'target_indices': {0: 'num_matches'}
+            'keypoints1': {0: 'num_features1'},
+            'keypoints2': {0: 'num_features2'},
+            'descriptors1': {0: 'num_features1'},
+            'descriptors2': {0: 'num_features2'},
+            'scales1': {0: 'num_features1'},
+            'scales2': {0: 'num_features2'},
+            'target_indices': {0: 'num_features1'}
         }
     )
     print("Combined detect-and-match export completed successfully!")
@@ -824,22 +828,58 @@ def validate_onnx_detect_and_match(onnx_path, test_image1_path, test_image2_path
         print(f"Output {i}: {output.shape}")
 
     # Extract outputs
-    keypoints1 = outputs[0]
-    keypoints2 = outputs[1]
-    descriptors1 = outputs[2]
-    descriptors2 = outputs[3]
-    target_indices = outputs[4]
+    keypoints1 = outputs[0]  # All keypoints from image 1
+    keypoints2 = outputs[1]  # All keypoints from image 2
+    descriptors1 = outputs[2]  # All descriptors from image 1
+    descriptors2 = outputs[3]  # All descriptors from image 2
+    scales1 = outputs[4]  # All scales from image 1
+    scales2 = outputs[5]  # All scales from image 2
+    # For each feature in image 1, index in image 2 (-1 for no match)
+    target_indices = outputs[6]
 
     print(f"\nDetect-and-match results:")
-    print(f"Matched keypoints 1: {keypoints1.shape}")
-    print(f"Matched keypoints 2: {keypoints2.shape}")
-    print(f"Descriptors 1: {descriptors1.shape}")
-    print(f"Descriptors 2: {descriptors2.shape}")
+    print(f"All keypoints 1: {keypoints1.shape}")
+    print(f"All keypoints 2: {keypoints2.shape}")
+    print(f"All descriptors 1: {descriptors1.shape}")
+    print(f"All descriptors 2: {descriptors2.shape}")
     print(f"Target indices: {target_indices.shape}")
-    print(f"Number of matches: {len(keypoints1)}")
+    print(f"Total features in image 1: {len(keypoints1)}")
+    print(f"Total features in image 2: {len(keypoints2)}")
     print(f"Number of valid correspondences: {(target_indices >= 0).sum()}")
 
-    if save_visualization and len(keypoints1) > 0:
+    # Extract matched keypoints for visualization
+    valid_matches = target_indices >= 0
+    matched_kpts1 = keypoints1[valid_matches]
+    matched_indices2 = target_indices[valid_matches]
+    matched_kpts2 = keypoints2[matched_indices2]
+
+    # Extract unmatched keypoints for visualization
+    unmatched_kpts1 = keypoints1[~valid_matches]
+
+    # For image 2, we need to find keypoints that are not referenced by any valid match
+    used_indices2 = set(matched_indices2.tolist())
+    all_indices2 = set(range(len(keypoints2)))
+    unused_indices2 = list(all_indices2 - used_indices2)
+    unmatched_kpts2 = keypoints2[unused_indices2] if unused_indices2 else np.array([
+    ])
+
+    print(f"Matched keypoints 1: {matched_kpts1.shape}")
+    print(f"Matched keypoints 2: {matched_kpts2.shape}")
+    print(f"Unmatched keypoints 1: {unmatched_kpts1.shape}")
+    print(f"Unmatched keypoints 2: {unmatched_kpts2.shape}")
+
+    # find number of matches at each scale
+    num_matches_by_scale = {}
+    for i in range(len(keypoints1)):
+        scale = scales1[i]
+        # check if match is valid
+        if target_indices[i] != -1:
+            if scale not in num_matches_by_scale:
+                num_matches_by_scale[scale] = 0
+            num_matches_by_scale[scale] += 1
+    print(f"Number of matches at each scale: {num_matches_by_scale}")
+
+    if save_visualization and (len(matched_kpts1) > 0 or len(unmatched_kpts1) > 0 or len(unmatched_kpts2) > 0):
         # Create output filename
         base_name1 = os.path.splitext(os.path.basename(test_image1_path))[0]
         base_name2 = os.path.splitext(os.path.basename(test_image2_path))[0]
@@ -850,13 +890,17 @@ def validate_onnx_detect_and_match(onnx_path, test_image1_path, test_image2_path
         img1_cv = cv2.cvtColor(np.array(test_image1), cv2.COLOR_RGB2BGR)
         img2_cv = cv2.cvtColor(np.array(test_image2), cv2.COLOR_RGB2BGR)
 
-        # Create visualization
+        # Create visualization using matched and unmatched keypoints
         canvas = warp_corners_and_draw_matches(
-            keypoints1, keypoints2, img1_cv, img2_cv)
+            matched_kpts1, matched_kpts2, img1_cv, img2_cv,
+            unmatched_kpts1, unmatched_kpts2)
 
         # Save visualization
         cv2.imwrite(output_path, canvas)
         print(f"Combined match visualization saved to: {output_path}")
+        print(
+            f"Visualization shows {len(matched_kpts1)} valid matches out of {len(keypoints1)} features")
+        print("Legend: Green lines = matches, Red circles = unmatched features")
 
     print("\nCombined detect-and-match validation successful!")
     return outputs

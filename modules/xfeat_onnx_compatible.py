@@ -254,7 +254,7 @@ class XFeat(nn.Module):
         return valid_coords
 
     @torch.inference_mode()
-    def match_xfeat_star_onnx(self, dec1_ids, dec1_kps, dec1_desc, dec1_scales, dec2_ids, dec2_kps, dec2_desc):
+    def match_xfeat_star(self, dec1_ids, dec1_kps, dec1_desc, dec1_scales, dec2_ids, dec2_kps, dec2_desc):
 
         dec1_scales = dec1_scales.squeeze(2)
         matched_idx_ref = []
@@ -487,10 +487,10 @@ class XFeat(nn.Module):
         return x
 
     @torch.inference_mode()
-    def detect_and_match_dense(self, img1, img2, top_k=8000, min_cossim=0.82, fine_conf=0.25):
+    def detect_and_match_dense(self, img1, img2, top_k=2000, min_cossim=0.82, fine_conf=0.25):
         """
         ONNX-compatible version of detect_and_match_dense function with feature refinement.
-        Detects dense features in two images, matches them with refinement, and returns correspondence information.
+        Detects dense features in two images, matches them with refinement, and returns all features plus correspondence information.
 
         Args:
             img1: First image tensor (B, C, H, W)
@@ -501,11 +501,13 @@ class XFeat(nn.Module):
 
         Returns:
             Tuple containing:
-                keypoints1: torch.Tensor(N, 2) - Refined matched keypoint locations in image 1
-                keypoints2: torch.Tensor(N, 2) - Matched keypoint locations in image 2  
-                descriptors1: torch.Tensor(N, 64) - Descriptors for matched features in image 1
-                descriptors2: torch.Tensor(N, 64) - Descriptors for matched features in image 2
-                target_indices: torch.Tensor(M,) - For each feature in image 1, index in image 2 (-1 for no match)
+                keypoints1: torch.Tensor(N, 2) - All keypoint locations in image 1 (with refinement applied to matched ones)
+                keypoints2: torch.Tensor(M, 2) - All keypoint locations in image 2  
+                descriptors1: torch.Tensor(N, 64) - All descriptors for features in image 1
+                descriptors2: torch.Tensor(M, 64) - All descriptors for features in image 2
+                scales1: torch.Tensor(N,) - All scales for features in image 1
+                scales2: torch.Tensor(M,) - All scales for features in image 2
+                target_indices: torch.Tensor(N,) - For each feature in image 1, index in image 2 (-1 for no match)
         """
         # Detect dense features in both images
         kpts1, scales1, desc1 = self.extract_dualscale(img1, top_k)
@@ -545,16 +547,17 @@ class XFeat(nn.Module):
 
         # Filter matches based on confidence
         mask_good = conf > fine_conf
-        refined_mkpts_0 = mkpts_0[mask_good]
-        refined_mkpts_1 = mkpts_1[mask_good]
-        refined_feats1 = feats1_matched[mask_good]
-        refined_feats2 = feats2_matched[mask_good]
         refined_idx0 = idx0_matched[mask_good]
         refined_idx1 = idx1_matched[mask_good]
+        refined_mkpts_0 = mkpts_0[mask_good]
 
         # Create target indices array for all features in image 1
         target_indices_all = torch.full(
             (kpts1.shape[1],), -1, dtype=torch.long, device=kpts1.device)
         target_indices_all[refined_idx0] = refined_idx1
 
-        return refined_mkpts_0, refined_mkpts_1, refined_feats1, refined_feats2, target_indices_all
+        # Apply refinements to all keypoints in image 1
+        all_kpts1 = kpts1[b].clone()
+        all_kpts1[refined_idx0] = refined_mkpts_0
+
+        return all_kpts1, kpts2[b], desc1[b], desc2[b], scales1[b], scales2[b], target_indices_all
