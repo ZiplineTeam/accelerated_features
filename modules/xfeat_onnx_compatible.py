@@ -319,8 +319,9 @@ class XFeat(nn.Module):
         valid_matches = mutual & good
 
         # Create output array initialized with -1 (no match)
-        target_indices = torch.full((match12.shape[0],), -1, dtype=torch.long, device=match12.device)
-        
+        target_indices = torch.full(
+            (match12.shape[0],), -1, dtype=torch.long, device=match12.device)
+
         # Fill in valid matches
         target_indices[valid_matches] = match12[valid_matches]
 
@@ -484,3 +485,76 @@ class XFeat(nn.Module):
             x = torch.tensor(x).permute(0, 3, 1, 2)/255
 
         return x
+
+    @torch.inference_mode()
+    def detect_and_match_dense(self, img1, img2, top_k=8000, min_cossim=0.82, fine_conf=0.25):
+        """
+        ONNX-compatible version of detect_and_match_dense function with feature refinement.
+        Detects dense features in two images, matches them with refinement, and returns correspondence information.
+
+        Args:
+            img1: First image tensor (B, C, H, W)
+            img2: Second image tensor (B, C, H, W)
+            top_k: Number of top features to extract per image
+            min_cossim: Minimum cosine similarity for matching
+            fine_conf: Confidence threshold for refined matches
+
+        Returns:
+            Tuple containing:
+                keypoints1: torch.Tensor(N, 2) - Refined matched keypoint locations in image 1
+                keypoints2: torch.Tensor(N, 2) - Matched keypoint locations in image 2  
+                descriptors1: torch.Tensor(N, 64) - Descriptors for matched features in image 1
+                descriptors2: torch.Tensor(N, 64) - Descriptors for matched features in image 2
+                target_indices: torch.Tensor(M,) - For each feature in image 1, index in image 2 (-1 for no match)
+        """
+        # Detect dense features in both images
+        kpts1, scales1, desc1 = self.extract_dualscale(img1, top_k)
+        kpts2, scales2, desc2 = self.extract_dualscale(img2, top_k)
+
+        # Perform initial matching using batch_match approach
+        B = desc1.shape[0]
+        cossim = torch.bmm(desc1, desc2.permute(0, 2, 1))
+        match12 = torch.argmax(cossim, dim=-1)
+        match21 = torch.argmax(cossim.permute(0, 2, 1), dim=-1)
+
+        idx0 = torch.arange(match12[0].shape[0], device=match12.device)
+
+        # Find mutual matches for first batch (assuming B=1)
+        b = 0
+        mutual = match21[b][match12[b]] == idx0
+        cossim_max, _ = cossim[b].max(dim=1)
+        good = cossim_max > min_cossim
+        idx0_matched = idx0[mutual & good]
+        idx1_matched = match12[b][mutual & good]
+
+        # Extract matched features for refinement
+        feats1_matched = desc1[b][idx0_matched]
+        feats2_matched = desc2[b][idx1_matched]
+        mkpts_0 = kpts1[b][idx0_matched].clone()
+        mkpts_1 = kpts2[b][idx1_matched]
+        sc0 = scales1[b][idx0_matched]
+
+        # Compute fine offsets using the fine matcher
+        offsets = self.net.fine_matcher(
+            torch.cat([feats1_matched, feats2_matched], dim=-1))
+        conf = F.softmax(offsets*3, dim=-1).max(dim=-1)[0]
+        offsets = self.subpix_softmax2d(offsets.view(-1, 8, 8))
+
+        # Apply refinement to keypoints in image 1
+        mkpts_0 += offsets * (sc0[:, None])
+
+        # Filter matches based on confidence
+        mask_good = conf > fine_conf
+        refined_mkpts_0 = mkpts_0[mask_good]
+        refined_mkpts_1 = mkpts_1[mask_good]
+        refined_feats1 = feats1_matched[mask_good]
+        refined_feats2 = feats2_matched[mask_good]
+        refined_idx0 = idx0_matched[mask_good]
+        refined_idx1 = idx1_matched[mask_good]
+
+        # Create target indices array for all features in image 1
+        target_indices_all = torch.full(
+            (kpts1.shape[1],), -1, dtype=torch.long, device=kpts1.device)
+        target_indices_all[refined_idx0] = refined_idx1
+
+        return refined_mkpts_0, refined_mkpts_1, refined_feats1, refined_feats2, target_indices_all

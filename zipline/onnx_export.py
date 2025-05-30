@@ -690,7 +690,7 @@ def export_matcher(xfeat_model, output_path, device):
 
         @torch.inference_mode()
         def forward(self, dec1_ids, dec1_kps, dec1_desc, dec1_scales, dec2_ids, dec2_kps, dec2_desc):
-            return self.model.match_xfeat_star_onnx(
+            return self.model.match_xfeat_star(
                 dec1_ids, dec1_kps, dec1_desc, dec1_scales,
                 dec2_ids, dec2_kps, dec2_desc)
 
@@ -741,17 +741,140 @@ def export_matcher(xfeat_model, output_path, device):
     print("Matcher export completed successfully!")
 
 
+def export_detect_and_match_dense(xfeat_model, output_path, device):
+    """Export the combined detect_and_match_dense model to ONNX."""
+    print(f"\nExporting combined detect-and-match model to {output_path}...")
+
+    # Create wrapper for combined detection and matching
+    class DetectAndMatchWrapper(torch.nn.Module):
+        def __init__(self, model):
+            super(DetectAndMatchWrapper, self).__init__()
+            self.model = model
+
+        @torch.inference_mode()
+        def forward(self, img1, img2):
+            return self.model.detect_and_match_dense(img1, img2, top_k=2000, min_cossim=0.82)
+
+    detect_match_wrapper = DetectAndMatchWrapper(xfeat_model)
+    detect_match_wrapper = detect_match_wrapper.to(device)
+
+    # Create dummy inputs for export (grayscale images)
+    dummy_img1 = torch.randn(1, 1, 480, 640, device=device)
+    dummy_img2 = torch.randn(1, 1, 480, 640, device=device)
+
+    # Export to ONNX
+    torch.onnx.export(
+        detect_match_wrapper,
+        (dummy_img1, dummy_img2),
+        output_path,
+        export_params=True,
+        opset_version=18,
+        training=torch.onnx.TrainingMode.EVAL,
+        do_constant_folding=True,
+        input_names=['img1', 'img2'],
+        output_names=['keypoints1', 'keypoints2',
+                      'descriptors1', 'descriptors2', 'target_indices'],
+        dynamic_axes={
+            'img1': {2: 'height1', 3: 'width1'},
+            'img2': {2: 'height2', 3: 'width2'},
+            'keypoints1': {0: 'num_matches'},
+            'keypoints2': {0: 'num_matches'},
+            'descriptors1': {0: 'num_matches'},
+            'descriptors2': {0: 'num_matches'},
+            'target_indices': {0: 'num_matches'}
+        }
+    )
+    print("Combined detect-and-match export completed successfully!")
+
+
+def validate_onnx_detect_and_match(onnx_path, test_image1_path, test_image2_path, save_visualization=True):
+    """Validate ONNX detect_and_match model by running inference on two test images."""
+    print(
+        f"Validating ONNX detect-and-match model with test images: {test_image1_path}, {test_image2_path}")
+
+    # Load and prepare test images
+    test_image1 = Image.open(test_image1_path)
+    test_image2 = Image.open(test_image2_path)
+
+    test_input1 = prepare_detect_input(test_image1)
+    test_input2 = prepare_detect_input(test_image2)
+
+    test_input1_np = test_input1.cpu().detach().numpy()
+    test_input2_np = test_input2.cpu().detach().numpy()
+
+    # Load ONNX session
+    session = setup_onnx_session(onnx_path, "detect-and-match")
+
+    # Run inference with timing
+    print("Running combined detect-and-match inference...")
+    inputs = {'img1': test_input1_np, 'img2': test_input2_np}
+
+    # Warm up
+    _ = session.run(None, inputs)
+
+    # Measure
+    start_time = time.time()
+    outputs = session.run(None, inputs)
+    end_time = time.time()
+    inference_time = (end_time - start_time) * 1000
+    print(f"Combined inference time: {inference_time:.2f} ms")
+
+    print("\nOutput shapes:")
+    for i, output in enumerate(outputs):
+        print(f"Output {i}: {output.shape}")
+
+    # Extract outputs
+    keypoints1 = outputs[0]
+    keypoints2 = outputs[1]
+    descriptors1 = outputs[2]
+    descriptors2 = outputs[3]
+    target_indices = outputs[4]
+
+    print(f"\nDetect-and-match results:")
+    print(f"Matched keypoints 1: {keypoints1.shape}")
+    print(f"Matched keypoints 2: {keypoints2.shape}")
+    print(f"Descriptors 1: {descriptors1.shape}")
+    print(f"Descriptors 2: {descriptors2.shape}")
+    print(f"Target indices: {target_indices.shape}")
+    print(f"Number of matches: {len(keypoints1)}")
+    print(f"Number of valid correspondences: {(target_indices >= 0).sum()}")
+
+    if save_visualization and len(keypoints1) > 0:
+        # Create output filename
+        base_name1 = os.path.splitext(os.path.basename(test_image1_path))[0]
+        base_name2 = os.path.splitext(os.path.basename(test_image2_path))[0]
+        model_name = os.path.splitext(os.path.basename(onnx_path))[0]
+        output_path = f"combined_matches_visualization_{model_name}_{base_name1}_{base_name2}.png"
+
+        # Convert PIL images to OpenCV format
+        img1_cv = cv2.cvtColor(np.array(test_image1), cv2.COLOR_RGB2BGR)
+        img2_cv = cv2.cvtColor(np.array(test_image2), cv2.COLOR_RGB2BGR)
+
+        # Create visualization
+        canvas = warp_corners_and_draw_matches(
+            keypoints1, keypoints2, img1_cv, img2_cv)
+
+        # Save visualization
+        cv2.imwrite(output_path, canvas)
+        print(f"Combined match visualization saved to: {output_path}")
+
+    print("\nCombined detect-and-match validation successful!")
+    return outputs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Export XFeat model to ONNX format')
-    parser.add_argument('--model', type=str, choices=['detect', 'detect-sparse', 'match', 'all'], default='detect',
-                        help='Which model to export: detect (dense), detect-sparse, match, both (dense+match), or all (dense+sparse+match)')
+    parser.add_argument('--model', type=str, choices=['detect', 'detect-sparse', 'match', 'detect-and-match', 'all'], default='detect',
+                        help='Which model to export: detect (dense), detect-sparse, match, detect-and-match (combined), or all')
     parser.add_argument('--output-detect', type=str, default='xfeat_star_detect.onnx',
                         help='Output path for dense detector ONNX model')
     parser.add_argument('--output-detect-sparse', type=str, default='xfeat_sparse_detect.onnx',
                         help='Output path for sparse detector ONNX model')
     parser.add_argument('--output-match', type=str, default='xfeat_star_match.onnx',
                         help='Output path for matcher ONNX model')
+    parser.add_argument('--output-detect-and-match', type=str, default='xfeat_detect_and_match.onnx',
+                        help='Output path for combined detect-and-match ONNX model')
     parser.add_argument('--validate', action='store_true',
                         help='Validate ONNX model with test images')
     parser.add_argument('--test-image', type=str, default='../assets/test_image.jpg',
@@ -781,6 +904,10 @@ def main():
     if args.model in ['match', 'all']:
         export_matcher(xfeat_model, args.output_match, device)
 
+    if args.model in ['detect-and-match', 'all']:
+        export_detect_and_match_dense(
+            xfeat_model, args.output_detect_and_match, device)
+
     # Validate if requested
     if args.validate:
         if args.model in ['detect', 'all']:
@@ -800,6 +927,10 @@ def main():
                 return
             validate_onnx_matcher(detector_path, args.output_match,
                                   args.test_image, args.test_image2, save_visualization=save_viz)
+
+        if args.model in ['detect-and-match', 'all']:
+            validate_onnx_detect_and_match(
+                args.output_detect_and_match, args.test_image, args.test_image2, save_visualization=save_viz)
 
 
 if __name__ == '__main__':
