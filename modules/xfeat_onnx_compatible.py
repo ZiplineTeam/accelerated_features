@@ -80,18 +80,17 @@ class XFeat(nn.Module):
             top_k = self.top_k
         if multiscale:
             print("doing multiscale")
-            mkpts, sc, feats = self.extract_dualscale(x, top_k)
+            mkpts, scale_tensor, feats = self.extract_dualscale(x, top_k)
         else:
             print("doing single scale")
-            mkpts, feats = self.extractDense(x, top_k)
-            sc = torch.ones(mkpts.shape[:2], device=mkpts.device)
+            mkpts, scale_tensor, feats = self.extractDense(x, top_k)
 
         print("keypoint ranges: ", mkpts[:, :, 0].min(
         ), mkpts[:, :, 0].max(), mkpts[:, :, 1].min(), mkpts[:, :, 1].max())
 
         return {'keypoints': mkpts,
                 'descriptors': feats,
-                'scales': sc}
+                'scales': scale_tensor}
 
     @torch.inference_mode()
     def xfeat_detect(self, img, top_k):
@@ -216,22 +215,26 @@ class XFeat(nn.Module):
     def NMS(self, x, threshold=0.05, kernel_size=5):
         B, C, H, W = x.shape
         pad = kernel_size//2
-        # Apply max pooling along width
-        x_horizontal = F.max_pool1d(
-            x.view(B * C * H, W).unsqueeze(1),
-            kernel_size=kernel_size,
-            stride=1,
-            padding=pad
-        ).squeeze(1).view(B, C, H, W)
+        # # Apply max pooling along width
+        # x_horizontal = F.max_pool1d(
+        #     x.view(B * C * H, W).unsqueeze(1),
+        #     kernel_size=kernel_size,
+        #     stride=1,
+        #     padding=pad
+        # ).squeeze(1).view(B, C, H, W)
 
-        # Apply max pooling along height
-        local_max = F.max_pool1d(
-            x_horizontal.permute(0, 1, 3, 2).contiguous().view(
-                B * C * W, H).unsqueeze(1),
-            kernel_size=kernel_size,
-            stride=1,
-            padding=pad
-        ).squeeze(1).view(B, C, W, H).permute(0, 1, 3, 2)
+        # # Apply max pooling along height
+        # local_max = F.max_pool1d(
+        #     x_horizontal.permute(0, 1, 3, 2).contiguous().view(
+        #         B * C * W, H).unsqueeze(1),
+        #     kernel_size=kernel_size,
+        #     stride=1,
+        #     padding=pad
+        # ).squeeze(1).view(B, C, W, H).permute(0, 1, 3, 2)
+
+        # use 2d maxpooling
+        local_max = F.max_pool2d(
+            x, kernel_size=kernel_size, stride=1, padding=pad)
 
         pos = (x == local_max) & (x >= threshold)
 
@@ -254,7 +257,7 @@ class XFeat(nn.Module):
         return valid_coords
 
     @torch.inference_mode()
-    def match_xfeat_star(self, dec1_ids, dec1_kps, dec1_desc, dec1_scales, dec2_ids, dec2_kps, dec2_desc):
+    def match_xfeat_star(self, dec1_ids, dec1_kps, dec1_desc, dec1_scales, dec2_ids, dec2_kps, dec2_desc, dec2_scales):
 
         dec1_scales = dec1_scales.squeeze(2)
         matched_idx_ref = []
@@ -270,7 +273,7 @@ class XFeat(nn.Module):
         matches = []
         for b in range(1):
             match, idx0, idx1 = self.refine_matches(
-                dec1_kps, dec1_desc, dec1_scales, dec2_kps, dec2_desc, matches=idxs_list, batch_idx=b)
+                dec1_kps, dec1_desc, dec1_scales, dec2_kps, dec2_desc, dec2_scales, matches=idxs_list, batch_idx=b)
             match = match.float()
             matches.append(match)
             matched_idx_ref.append(idx0)
@@ -327,20 +330,41 @@ class XFeat(nn.Module):
 
         return target_indices
 
-    def preprocess_tensor(self, x):
-        """ Guarantee that image is divisible by 32 to avoid aliasing artifacts.
-            If the image is larger than 1920x1080, it will first be resized to 1920x1080.
+    def preprocess_tensor(self, x, scale_factor=1.0):
+        """
+        First resize the image to a maximum size if needed, then scale it by the optional scale factor.
+        Finally, make the image dimensions divisible by 32.
         """
         if isinstance(x, np.ndarray) and len(x.shape) == 3:
             x = torch.tensor(x).permute(2, 0, 1)[None]
         x = x.float()
 
-        H, W = x.shape[-2:]
-        _H, _W = max(H, 1920), max(W, 1080)
-        _H, _W = (_H//32) * 32, (_W//32) * 32
-        rh, rw = H/_H, W/_W
+        # For ONNX compatibility, enforce maximum size constraints using tensor operations
+        B, C, H, W = x.shape
 
-        x = F.interpolate(x, (_H, _W), mode='bilinear', align_corners=False)
+        # Enforce maximum input dimensions (before the optional scale factor is applied)
+        max_height = torch.full((), 1440, device=x.device, dtype=H.dtype)
+        max_width = torch.full((), 2560, device=x.device, dtype=W.dtype)
+
+        target_H = torch.minimum(H, max_height)
+        target_W = torch.minimum(W, max_width)
+
+        # Apply additional scale factor
+        target_H = target_H * scale_factor
+        target_W = target_W * scale_factor
+
+        # Make divisible by 32
+        target_H = (target_H // 32) * 32
+        target_W = (target_W // 32) * 32
+
+        # Calculate final scaling factors
+        rh = H.float() / target_H.float()
+        rw = W.float() / target_W.float()
+
+        # Resize to target dimensions
+        x = F.interpolate(x, size=(target_H.int(), target_W.int()),
+                          mode='bilinear', align_corners=False)
+
         return x, rh, rw
 
     def batch_match(self, feats1, feats2, min_cossim=0.82):
@@ -381,35 +405,60 @@ class XFeat(nn.Module):
 
         return coords
 
-    def refine_matches(self, dec1_kps, dec1_desc, dec1_scales, dec2_kps, dec2_desc, matches, batch_idx, fine_conf=0.25):
+    def refine_matches(self, dec1_kps, dec1_desc, dec1_scales, dec2_kps, dec2_desc, dec2_scales, matches, batch_idx, fine_conf=0.25):
         idx0, idx1 = matches[batch_idx]
         feats1 = dec1_desc[batch_idx][idx0]
         feats2 = dec2_desc[batch_idx][idx1]
         mkpts_0 = dec1_kps[batch_idx][idx0]
         mkpts_1 = dec2_kps[batch_idx][idx1]
         sc0 = dec1_scales[batch_idx][idx0]
+        sc1 = dec2_scales[batch_idx][idx1]
 
         # Compute fine offsets
         offsets = self.net.fine_matcher(torch.cat([feats1, feats2], dim=-1))
         conf = F.softmax(offsets*3, dim=-1).max(dim=-1)[0]
         offsets = self.subpix_softmax2d(offsets.view(-1, 8, 8))
 
-        mkpts_0 += offsets * (sc0[:, None])  # ! change this back to to mkpts_1
+        mkpts_0 += offsets * (sc0[:, None] / sc1[:, None])
 
         mask_good = conf > fine_conf
-        # print("mask_good: ", mask_good)
         mkpts_0 = mkpts_0[mask_good]
         mkpts_1 = mkpts_1[mask_good]
 
-        # print("idx0: ", idx0)
-        # print("idx1: ", idx1)
-
-        # print("mkpts_0: ", mkpts_0)
-        # print("mkpts_1: ", mkpts_1)
-        # if mkpts_0.shape[0] == 0:
-        #     return torch.tensor([[-1, -1, -1, -1]])
-
         return (torch.cat([mkpts_0, mkpts_1], dim=-1), idx0[mask_good], idx1[mask_good])
+
+    @torch.inference_mode()
+    def compute_pixel_offsets(self, dec1_desc, dec1_scales, dec2_desc, matches, fine_conf=0.25):
+        """
+        Compute pixel offsets for a single batch of matches.
+        Returns offsets and a mask of valid matches.
+        """
+        idx1, idx2 = matches
+        feats1 = dec1_desc[idx1]
+        feats2 = dec2_desc[idx2]
+        sc1 = dec1_scales[idx1]
+        # sc2 = dec2_scales[idx2]
+
+        relative_scale = sc1
+
+        print("feats1.shape: ", feats1.shape)
+        print("feats2.shape: ", feats2.shape)
+        print("sc1.shape: ", sc1.shape)
+        # print("sc2.shape: ", sc2.shape)
+        print("relative_scale.shape: ", relative_scale.shape)
+
+        # Compute fine offsets
+        offsets = self.net.fine_matcher(torch.cat([feats1, feats2], dim=-1))
+        conf = F.softmax(offsets*3, dim=-1).max(dim=-1)[0]
+        offsets = self.subpix_softmax2d(offsets.view(-1, 8, 8))
+
+        print("offsets.shape: ", offsets.shape)
+
+        # Apply scale to offsets
+        offsets = offsets * relative_scale
+        mask_good = conf > fine_conf
+
+        return (offsets, mask_good)
 
     def create_xy(self, h, w, dev):
         y, x = torch.meshgrid(torch.arange(h, device=dev),
@@ -417,13 +466,15 @@ class XFeat(nn.Module):
         xy = torch.cat([x[..., None], y[..., None]], -1).reshape(-1, 2)
         return xy
 
-    def extractDense(self, x, top_k=8_000):
+    def extractDense(self, x, top_k=8_000, scale_factor=1.0):
         if top_k < 1:
             top_k = 100_000_000
 
-        x, rh1, rw1 = self.preprocess_tensor(x)
+        x, rh, rw = self.preprocess_tensor(x, scale_factor)
+        print("extractDense: x shape: ", x.shape)
+        print("extractDense: (rh1, rw1): ", (rh, rw))
 
-        M1, K1, H1 = self.net(x)
+        M1, _K1, H1 = self.net(x)
 
         B, C, _H1, _W1 = M1.shape
 
@@ -449,33 +500,31 @@ class XFeat(nn.Module):
         mkpts = torch.gather(
             xy1, 1, top_k_indices[..., None].expand(-1, -1, 2))
 
-        if isinstance(rw1, float):  # Ensure rw1 and rh1 are tensors
-            rw1 = torch.full((), rw1, device=mkpts.device)
-        if isinstance(rh1, float):
-            rh1 = torch.full((), rh1, device=mkpts.device)
-        scale_tensor = torch.stack([rw1, rh1], dim=0).view(1, -1)
+        if isinstance(rw, float):  # Ensure rw and rh are tensors
+            rw = torch.full((), rw, device=mkpts.device)
+        if isinstance(rh, float):
+            rh = torch.full((), rh, device=mkpts.device)
+
+        scale_w = torch.full((1, mkpts.shape[1], 1), rw, device=mkpts.device)
+        scale_h = torch.full((1, mkpts.shape[1], 1), rh, device=mkpts.device)
+        scale_tensor = torch.cat([scale_w, scale_h], dim=-1)
         mkpts = mkpts * scale_tensor
 
-        return mkpts, feats
+        return mkpts, scale_tensor, feats
 
     def extract_dualscale(self, x, top_k, s1=0.6, s2=1.3):
-        x1 = F.interpolate(x, scale_factor=s1,
-                           align_corners=False, mode='bilinear')
-        x2 = F.interpolate(x, scale_factor=s2,
-                           align_corners=False, mode='bilinear')
-
         B, _, _, _ = x.shape
 
-        mkpts_1, feats_1 = self.extractDense(x1, int(top_k*0.20))
-        mkpts_2, feats_2 = self.extractDense(x2, int(top_k*0.80))
+        mkpts_1, scale_tensor_1, feats_1 = self.extractDense(
+            x, int(top_k*0.20), scale_factor=s1)
+        mkpts_2, scale_tensor_2, feats_2 = self.extractDense(
+            x, int(top_k*0.80), scale_factor=s2)
 
-        mkpts = torch.cat([mkpts_1/s1, mkpts_2/s2], dim=1)
-        sc1 = torch.ones(mkpts_1.shape[:2], device=mkpts_1.device) * (1/s1)
-        sc2 = torch.ones(mkpts_2.shape[:2], device=mkpts_2.device) * (1/s2)
-        sc = torch.cat([sc1, sc2], dim=1)
+        mkpts = torch.cat([mkpts_1, mkpts_2], dim=1)
+        scale_tensor = torch.cat([scale_tensor_1, scale_tensor_2], dim=1)
         feats = torch.cat([feats_1, feats_2], dim=1)
 
-        return mkpts, sc, feats
+        return mkpts, scale_tensor, feats
 
     def parse_input(self, x):
         if len(x.shape) == 3:
